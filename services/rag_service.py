@@ -117,13 +117,13 @@ def analyze_question(question: str) -> dict:
                         "Analyze the user's question about a document. Respond ONLY with "
                         "a JSON object with two fields:\n"
                         '"is_broad": true if the question asks for a summary, overview, '
-                        "general description, or 'what is this document about' — false if "
-                        "it asks about specific facts, fields, or values.\n"
+                        "general description, 'what is this document about', 'tell me "
+                        "about X' (where X is a general topic/concept the document covers), "
+                        "or any question best answered by understanding the whole document. "
+                        "false only for narrow questions asking about one specific isolated "
+                        "fact or value.\n"
                         '"search_terms": a JSON array of distinct topics/fields being asked '
-                        "about. Include common synonyms/related phrasings for each term "
-                        "(e.g. for 'skills' also consider 'technical skills', 'technologies', "
-                        "'programming languages', 'tools'). For broad questions, return an "
-                        "empty array. For specific questions, extract each distinct field."
+                        "about, with synonyms included. Empty array for broad questions."
                     )
                 },
                 {"role": "user", "content": question}
@@ -165,36 +165,11 @@ def retrieve_all_chunks(document_id: int, db: Session):
 
 
 # ---------------------------------------------------------------------------
-# STEP 7: QUESTION ANSWERING (RETRIEVAL + GENERATION)
+# STEP 7: ANSWER GENERATION (shared by primary attempt and fallback)
 # ---------------------------------------------------------------------------
 
-def answer_question(question: str, document_id: int, db: Session) -> dict:
-    analysis = analyze_question(question)
-    logger.info(f"Question analysis: {analysis}")
-
-    seen_ids = set()
-    merged_chunks = []
-
-    if analysis["is_broad"]:
-        all_chunks = retrieve_all_chunks(document_id, db)
-        MAX_CHUNKS_FOR_BROAD = 60
-        merged_chunks = all_chunks[:MAX_CHUNKS_FOR_BROAD]
-    else:
-        search_terms = analysis["search_terms"] or [question]
-        for term in search_terms:
-            results = retrieve_chunks_for_term(document_id, term, db, k=8)
-            for chunk in results:
-                if chunk.id not in seen_ids:
-                    seen_ids.add(chunk.id)
-                    merged_chunks.append(chunk)
-
-    if not merged_chunks:
-        return {
-            "reply": "I couldn't find relevant information in this document.",
-            "sources": []
-        }
-
-    context = "\n\n---\n\n".join(chunk.chunk_text for chunk in merged_chunks)
+def _generate_answer(question: str, chunks: list) -> dict:
+    context = "\n\n---\n\n".join(chunk.chunk_text for chunk in chunks)
 
     wants_detail = any(
         word in question.lower()
@@ -234,6 +209,54 @@ def answer_question(question: str, document_id: int, db: Session) -> dict:
     )
 
     answer = response.choices[0].message.content
-    sources = [chunk.chunk_text[:200] + "..." for chunk in merged_chunks[:10]]
+    sources = [chunk.chunk_text[:200] + "..." for chunk in chunks[:10]]
 
     return {"reply": answer, "sources": sources}
+
+
+# ---------------------------------------------------------------------------
+# STEP 8: MAIN QUESTION ANSWERING (with fallback escalation)
+# ---------------------------------------------------------------------------
+
+def answer_question(question: str, document_id: int, db: Session) -> dict:
+    analysis = analyze_question(question)
+    logger.info(f"Question analysis: {analysis}")
+
+    seen_ids = set()
+    merged_chunks = []
+
+    if analysis["is_broad"]:
+        all_chunks = retrieve_all_chunks(document_id, db)
+        MAX_CHUNKS_FOR_BROAD = 60
+        merged_chunks = all_chunks[:MAX_CHUNKS_FOR_BROAD]
+    else:
+        search_terms = analysis["search_terms"] or [question]
+        for term in search_terms:
+            results = retrieve_chunks_for_term(document_id, term, db, k=8)
+            for chunk in results:
+                if chunk.id not in seen_ids:
+                    seen_ids.add(chunk.id)
+                    merged_chunks.append(chunk)
+
+    if not merged_chunks:
+        return {
+            "reply": "I couldn't find relevant information in this document.",
+            "sources": []
+        }
+
+    result = _generate_answer(question, merged_chunks)
+
+    # FALLBACK: if narrow retrieval failed to answer, escalate to the
+    # full document rather than giving up. Handles cases where a term
+    # appears throughout the doc and precise retrieval can't isolate
+    # the one sentence that actually answers the question.
+    not_found_phrases = ["does not provide", "not found", "couldn't find", "no information", "not mentioned"]
+    if not analysis["is_broad"] and any(phrase in result["reply"].lower() for phrase in not_found_phrases):
+        logger.info("Narrow retrieval failed to answer — escalating to full document.")
+        all_chunks = retrieve_all_chunks(document_id, db)
+        fallback_chunks = all_chunks[:60]
+        fallback_result = _generate_answer(question, fallback_chunks)
+        if not any(phrase in fallback_result["reply"].lower() for phrase in not_found_phrases):
+            return fallback_result
+
+    return result
