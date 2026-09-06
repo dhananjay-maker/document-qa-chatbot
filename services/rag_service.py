@@ -23,11 +23,6 @@ CHAT_MODEL = "gpt-4o-mini"
 # ---------------------------------------------------------------------------
 
 def extract_text_from_pdf(file_path: str) -> str:
-    """
-    Extracts text from a PDF, prioritizing table structure detection
-    (critical for lab reports, invoices, forms — anything with tabular
-    data where naive text extraction scrambles column order).
-    """
     text_parts = []
     with pdfplumber.open(file_path) as pdf:
         for page in pdf.pages:
@@ -112,15 +107,6 @@ def process_document(file_path: str, document_id: int, db: Session):
 # ---------------------------------------------------------------------------
 
 def analyze_question(question: str) -> dict:
-    """
-    Uses a cheap LLM call to figure out:
-    1. Is this a BROAD question (summary, overview, "what is this about")
-       or a SPECIFIC question (asking for particular fields/values)?
-    2. If specific, break it into individual search terms so multi-part
-       questions ("what is X, Y, and Z") don't lose any part to retrieval
-       competition.
-    Falls back to treating it as one specific term if this call fails.
-    """
     try:
         response = client.chat.completions.create(
             model=CHAT_MODEL,
@@ -134,10 +120,10 @@ def analyze_question(question: str) -> dict:
                         "general description, or 'what is this document about' — false if "
                         "it asks about specific facts, fields, or values.\n"
                         '"search_terms": a JSON array of distinct topics/fields being asked '
-                        "about. For broad questions, return an empty array. For specific "
-                        "questions, extract each distinct field, e.g. "
-                        "'What is RBC, MCH and platelet count?' -> "
-                        '["RBC Count", "MCH", "Platelet Count"]'
+                        "about. Include common synonyms/related phrasings for each term "
+                        "(e.g. for 'skills' also consider 'technical skills', 'technologies', "
+                        "'programming languages', 'tools'). For broad questions, return an "
+                        "empty array. For specific questions, extract each distinct field."
                     )
                 },
                 {"role": "user", "content": question}
@@ -158,8 +144,7 @@ def analyze_question(question: str) -> dict:
 # STEP 6: RETRIEVAL
 # ---------------------------------------------------------------------------
 
-def retrieve_chunks_for_term(document_id: int, term: str, db: Session, k: int = 5):
-    """Retrieves the top-k most similar chunks for a single search term."""
+def retrieve_chunks_for_term(document_id: int, term: str, db: Session, k: int = 8):
     embedding = get_embedding(term)
     return (
         db.query(DocumentChunkModel)
@@ -171,11 +156,6 @@ def retrieve_chunks_for_term(document_id: int, term: str, db: Session, k: int = 
 
 
 def retrieve_all_chunks(document_id: int, db: Session):
-    """
-    Retrieves EVERY chunk for a document, ordered by original position.
-    Used for broad/summary questions where the whole document matters,
-    not just the top-matching fragments.
-    """
     return (
         db.query(DocumentChunkModel)
         .filter(DocumentChunkModel.document_id == document_id)
@@ -189,13 +169,6 @@ def retrieve_all_chunks(document_id: int, db: Session):
 # ---------------------------------------------------------------------------
 
 def answer_question(question: str, document_id: int, db: Session) -> dict:
-    """
-    Handles ANY kind of question about the document:
-    - Broad questions (summary, overview) -> pull the whole document
-      (up to a safe token limit) so nothing is missed
-    - Specific/multi-part questions -> decompose into individual search
-      terms, retrieve each separately, merge and deduplicate
-    """
     analysis = analyze_question(question)
     logger.info(f"Question analysis: {analysis}")
 
@@ -203,15 +176,13 @@ def answer_question(question: str, document_id: int, db: Session) -> dict:
     merged_chunks = []
 
     if analysis["is_broad"]:
-        # Broad question: pull the entire document, capped to avoid
-        # excessive token usage on very long PDFs.
         all_chunks = retrieve_all_chunks(document_id, db)
-        MAX_CHUNKS_FOR_BROAD = 60  # ~500 chars each, keeps context reasonable
+        MAX_CHUNKS_FOR_BROAD = 60
         merged_chunks = all_chunks[:MAX_CHUNKS_FOR_BROAD]
     else:
         search_terms = analysis["search_terms"] or [question]
         for term in search_terms:
-            results = retrieve_chunks_for_term(document_id, term, db, k=5)
+            results = retrieve_chunks_for_term(document_id, term, db, k=8)
             for chunk in results:
                 if chunk.id not in seen_ids:
                     seen_ids.add(chunk.id)
@@ -225,15 +196,29 @@ def answer_question(question: str, document_id: int, db: Session) -> dict:
 
     context = "\n\n---\n\n".join(chunk.chunk_text for chunk in merged_chunks)
 
+    wants_detail = any(
+        word in question.lower()
+        for word in ["detail", "in-depth", "explain fully", "elaborate", "comprehensive", "thorough", "full"]
+    )
+
+    length_instruction = (
+        "Give a detailed, well-organized answer covering the key points."
+        if wants_detail else
+        "Keep your answer SHORT and DIRECT — 2-4 sentences for most questions. "
+        "Do not use headers, numbered sections, or bold formatting unless the "
+        "question specifically asks for a list. Get straight to the point."
+    )
+
     system_prompt = (
         "You are a precise document assistant. Answer using ONLY the context "
         "provided below.\n\n"
-        "For specific facts/values, they must appear verbatim in the context — "
-        "never estimate, infer, or guess. If the user asks for multiple values "
-        "and only some are present, answer what you can find and clearly say "
-        "'Not found in the provided context' for each missing one.\n\n"
-        "For summary or overview questions, synthesize a clear, well-organized "
-        "answer covering the key sections and information present in the context."
+        f"{length_instruction}\n\n"
+        "For specific facts/values, they must appear verbatim or be clearly "
+        "implied in the context — never invent information. If the user asks "
+        "for something and it genuinely isn't present anywhere in the context, "
+        "say so clearly, but first check carefully — information may be phrased "
+        "differently than the exact question (e.g. a resume's 'Technical Skills' "
+        "section answers a question about 'skills')."
     )
 
     messages = [
@@ -244,10 +229,11 @@ def answer_question(question: str, document_id: int, db: Session) -> dict:
     response = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=messages,
-        temperature=0
+        temperature=0,
+        max_tokens=150 if not wants_detail else 600
     )
 
     answer = response.choices[0].message.content
-    sources = [chunk.chunk_text[:200] + "..." for chunk in merged_chunks[:10]]  # cap displayed sources
+    sources = [chunk.chunk_text[:200] + "..." for chunk in merged_chunks[:10]]
 
     return {"reply": answer, "sources": sources}

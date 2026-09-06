@@ -95,3 +95,24 @@ def chat_with_document(
 
     result = answer_question(request.message, doc.id, db)
     return ChatResponse(reply=result["reply"], sources=result["sources"])
+
+@router.get("/debug/{document_id}/raw-text")
+def debug_raw_text(
+    document_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """TEMPORARY: shows all stored chunks for a document, in order."""
+    doc = db.query(DocumentModel).filter(DocumentModel.id == document_id, DocumentModel.owner_id == current_user.id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    from models.document_chunk_model import DocumentChunkModel
+    chunks = (
+        db.query(DocumentChunkModel)
+        .filter(DocumentChunkModel.document_id == document_id)
+        .order_by(DocumentChunkModel.chunk_index)
+        .all()
+    )
+    return {"total_chunks": len(chunks), "chunks": [c.chunk_text for c in chunks]}
+    
