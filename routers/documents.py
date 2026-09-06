@@ -7,7 +7,7 @@ from database import SessionLocal
 from models.document_model import DocumentModel
 from models.user_model import UserModel
 from schemas.document import DocumentResponse, ChatRequest, ChatResponse
-from services.rag_service import process_document, answer_question, debug_raw_search
+from services.rag_service import process_document, answer_question
 from auth import get_current_user
 
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -93,28 +93,5 @@ def chat_with_document(
     if doc.status != "ready":
         raise HTTPException(status_code=400, detail=f"Document is still {doc.status}. Please wait.")
 
-    result = answer_question(request.message, doc.collection_name)
+    result = answer_question(request.message, doc.id, db)
     return ChatResponse(reply=result["reply"], sources=result["sources"])
-
-
-@router.get("/debug/{document_id}/search")
-def debug_search(
-    document_id: int,
-    query: str,
-    db: Session = Depends(get_db),
-    current_user: UserModel = Depends(get_current_user)
-):
-    """
-    TEMPORARY debug endpoint — bypasses the LLM and returns raw retrieved
-    chunks for a given query. Remove this before final production deploy.
-    """
-    doc = (
-        db.query(DocumentModel)
-        .filter(DocumentModel.id == document_id, DocumentModel.owner_id == current_user.id)
-        .first()
-    )
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    results = debug_raw_search(query, doc.collection_name)
-    return {"query": query, "results": results}
