@@ -5,7 +5,7 @@ logging.basicConfig(level=logging.INFO)
 from fastapi import FastAPI
 from routers import auth_routes, documents
 from database import Base, engine
-from models import document_chunk_model  # ensures table is registered with Base
+from models import document_chunk_model, chat_message_model
 
 app = FastAPI(title="Document Q&A Chatbot API")
 

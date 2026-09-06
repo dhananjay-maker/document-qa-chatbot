@@ -7,7 +7,8 @@ from database import SessionLocal
 from models.document_model import DocumentModel
 from models.user_model import UserModel
 from models.document_chunk_model import DocumentChunkModel
-from schemas.document import DocumentResponse, ChatRequest, ChatResponse
+from models.chat_message_model import ChatMessageModel
+from schemas.document import DocumentResponse, ChatRequest, ChatResponse, ChatMessageResponse
 from services.rag_service import process_document, answer_question
 from auth import get_current_user
 
@@ -83,7 +84,6 @@ def delete_document(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user)
 ):
-    """Deletes a single document and all its associated chunks."""
     doc = (
         db.query(DocumentModel)
         .filter(DocumentModel.id == document_id, DocumentModel.owner_id == current_user.id)
@@ -93,6 +93,7 @@ def delete_document(
         raise HTTPException(status_code=404, detail="Document not found")
 
     db.query(DocumentChunkModel).filter(DocumentChunkModel.document_id == document_id).delete()
+    db.query(ChatMessageModel).filter(ChatMessageModel.document_id == document_id).delete()
 
     file_path = os.path.join(UPLOAD_DIR, f"{current_user.id}_{doc.filename}")
     if os.path.exists(file_path):
@@ -112,7 +113,6 @@ def delete_all_documents(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user)
 ):
-    """Deletes ALL documents (and their chunks) belonging to the current user."""
     docs = db.query(DocumentModel).filter(DocumentModel.owner_id == current_user.id).all()
 
     if not docs:
@@ -121,6 +121,7 @@ def delete_all_documents(
     deleted_count = 0
     for doc in docs:
         db.query(DocumentChunkModel).filter(DocumentChunkModel.document_id == doc.id).delete()
+        db.query(ChatMessageModel).filter(ChatMessageModel.document_id == doc.id).delete()
 
         file_path = os.path.join(UPLOAD_DIR, f"{current_user.id}_{doc.filename}")
         if os.path.exists(file_path):
@@ -135,6 +136,30 @@ def delete_all_documents(
     db.commit()
 
     return {"message": f"Deleted {deleted_count} document(s)"}
+
+
+@router.get("/{document_id}/chat-history", response_model=list[ChatMessageResponse])
+def get_chat_history(
+    document_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """Returns all past chat messages for this document, in chronological order."""
+    doc = (
+        db.query(DocumentModel)
+        .filter(DocumentModel.id == document_id, DocumentModel.owner_id == current_user.id)
+        .first()
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    messages = (
+        db.query(ChatMessageModel)
+        .filter(ChatMessageModel.document_id == document_id, ChatMessageModel.owner_id == current_user.id)
+        .order_by(ChatMessageModel.created_at.asc())
+        .all()
+    )
+    return messages
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -154,7 +179,26 @@ def chat_with_document(
     if doc.status != "ready":
         raise HTTPException(status_code=400, detail=f"Document is still {doc.status}. Please wait.")
 
+    db.add(ChatMessageModel(
+        document_id=request.document_id,
+        owner_id=current_user.id,
+        text=request.message,
+        is_user=True,
+        sources=[]
+    ))
+    db.commit()
+
     result = answer_question(request.message, doc.id, db)
+
+    db.add(ChatMessageModel(
+        document_id=request.document_id,
+        owner_id=current_user.id,
+        text=result["reply"],
+        is_user=False,
+        sources=result["sources"]
+    ))
+    db.commit()
+
     return ChatResponse(reply=result["reply"], sources=result["sources"])
 
 
@@ -164,7 +208,6 @@ def debug_raw_text(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user)
 ):
-    """TEMPORARY: shows all stored chunks for a document, in order."""
     doc = db.query(DocumentModel).filter(DocumentModel.id == document_id, DocumentModel.owner_id == current_user.id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
