@@ -185,15 +185,16 @@ def _generate_answer(question: str, chunks: list) -> dict:
     )
 
     system_prompt = (
-        "You are a precise document assistant. Answer using ONLY the context "
-        "provided below.\n\n"
+         "You are a precise document assistant. Answer using ONLY the context "
+         "provided below — never use outside knowledge to fill gaps.\n\n"
         f"{length_instruction}\n\n"
-        "For specific facts/values, they must appear verbatim or be clearly "
-        "implied in the context — never invent information. If the user asks "
-        "for something and it genuinely isn't present anywhere in the context, "
-        "say so clearly, but first check carefully — information may be phrased "
-        "differently than the exact question (e.g. a resume's 'Technical Skills' "
-        "section answers a question about 'skills')."
+        "CRITICAL: Read the ENTIRE context carefully before answering. If the "
+        "information the user asked about appears ANYWHERE in the context — even "
+        "briefly, even mentioned in passing — state it directly and confidently. "
+        "Do NOT say 'the context does not provide X' if X is actually present "
+        "anywhere in the context, even in a single sentence. Only say information "
+        "is missing if you have genuinely checked the entire context and it truly "
+        "does not appear."
     )
 
     messages = [
