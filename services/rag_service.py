@@ -103,7 +103,51 @@ def process_document(file_path: str, document_id: int, db: Session):
 
 
 # ---------------------------------------------------------------------------
-# STEP 5: QUESTION CLASSIFICATION + DECOMPOSITION
+# STEP 5: PRODUCTION GUARDRAIL — REQUEST INTENT CLASSIFICATION
+# ---------------------------------------------------------------------------
+
+def classify_request_intent(question: str) -> dict:
+    """
+    Production guardrail: classifies the user's request BEFORE running
+    the full RAG pipeline, to catch off-topic, malformed, code-generation,
+    or raw-data-dump requests early with a clean, safe response instead
+    of letting them fall through to confusing or unsafe outputs.
+    """
+    try:
+        response = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Classify the user's message about a document into exactly one "
+                        "category. Respond ONLY with JSON: {\"category\": \"...\"}\n\n"
+                        "Categories:\n"
+                        "- 'document_question': A genuine question about the document's content, "
+                        "including short/single-word topic mentions (e.g. 'RAG', 'skills', "
+                        "'other use case') — these should be treated as document questions, "
+                        "NOT unclear, since users often type short queries.\n"
+                        "- 'code_generation_request': Explicitly asking to WRITE or GENERATE new "
+                        "code, not asking what the document says about a technical topic.\n"
+                        "- 'raw_data_request': Explicitly asking for raw chunks, internal data "
+                        "dumps, or debug-style output rather than a normal answer.\n"
+                        "- 'off_topic': Clearly unrelated to any document (weather, general "
+                        "chitchat, requests with no connection to documents at all)."
+                    )
+                },
+                {"role": "user", "content": question}
+            ],
+            temperature=0
+        )
+        result = json.loads(response.choices[0].message.content)
+        return result
+    except Exception as e:
+        logger.warning(f"Intent classification failed: {e}")
+        return {"category": "document_question"}  # fail open
+
+
+# ---------------------------------------------------------------------------
+# STEP 6: QUESTION CLASSIFICATION + DECOMPOSITION
 # ---------------------------------------------------------------------------
 
 def analyze_question(question: str) -> dict:
@@ -114,14 +158,15 @@ def analyze_question(question: str) -> dict:
                 {
                     "role": "system",
                     "content": (
-                        "Analyze the user's question about a document. Respond ONLY with "
-                        "a JSON object with two fields:\n"
-                        '"is_broad": true if the question asks for a summary, overview, '
-                        "general description, 'what is this document about', 'tell me "
-                        "about X' (where X is a general topic/concept the document covers), "
-                        "or any question best answered by understanding the whole document. "
-                        "false only for narrow questions asking about one specific isolated "
-                        "fact or value.\n"
+                        "Analyze the user's message about a document, even if it's a single "
+                        "word or short fragment — infer their likely intent as a genuine "
+                        "question about that topic. Respond ONLY with a JSON object with "
+                        "two fields:\n"
+                        '"is_broad": true if this is a general/overview question about a '
+                        "topic — including single-word topic mentions (treat 'RAG' as 'tell "
+                        "me about RAG'), 'tell me about X', summaries, or 'what is this "
+                        "document about'. false only for narrow questions asking about one "
+                        "specific isolated fact or value.\n"
                         '"search_terms": a JSON array of distinct topics/fields being asked '
                         "about, with synonyms included. Empty array for broad questions."
                     )
@@ -132,16 +177,16 @@ def analyze_question(question: str) -> dict:
         )
         result = json.loads(response.choices[0].message.content)
         return {
-            "is_broad": result.get("is_broad", False),
+            "is_broad": result.get("is_broad", True),
             "search_terms": result.get("search_terms", [question])
         }
     except Exception as e:
         logger.warning(f"Question analysis failed, using fallback: {e}")
-        return {"is_broad": False, "search_terms": [question]}
+        return {"is_broad": True, "search_terms": [question]}
 
 
 # ---------------------------------------------------------------------------
-# STEP 6: RETRIEVAL
+# STEP 7: RETRIEVAL
 # ---------------------------------------------------------------------------
 
 def retrieve_chunks_for_term(document_id: int, term: str, db: Session, k: int = 8):
@@ -165,7 +210,7 @@ def retrieve_all_chunks(document_id: int, db: Session):
 
 
 # ---------------------------------------------------------------------------
-# STEP 7: ANSWER GENERATION (shared by primary attempt and fallback)
+# STEP 8: ANSWER GENERATION (shared by primary attempt and fallback)
 # ---------------------------------------------------------------------------
 
 def _generate_answer(question: str, chunks: list) -> dict:
@@ -185,16 +230,23 @@ def _generate_answer(question: str, chunks: list) -> dict:
     )
 
     system_prompt = (
-         "You are a precise document assistant. Answer using ONLY the context "
-         "provided below — never use outside knowledge to fill gaps.\n\n"
+        "You are a precise document assistant. Answer using ONLY the context "
+        "provided below — never use outside knowledge to fill gaps.\n\n"
         f"{length_instruction}\n\n"
-        "CRITICAL: Read the ENTIRE context carefully before answering. If the "
-        "information the user asked about appears ANYWHERE in the context — even "
-        "briefly, even mentioned in passing — state it directly and confidently. "
-        "Do NOT say 'the context does not provide X' if X is actually present "
-        "anywhere in the context, even in a single sentence. Only say information "
-        "is missing if you have genuinely checked the entire context and it truly "
-        "does not appear."
+        "CRITICAL: Read the ENTIRE context carefully. If a term is mentioned or "
+        "briefly explained (even just an acronym expansion) but not explained in "
+        "full depth, say what IS present rather than claiming nothing is found. "
+        "Only say information is missing if you have genuinely checked the entire "
+        "context and it truly does not appear.\n\n"
+        "NEVER include raw formatting artifacts, page numbers, barcode text, or "
+        "OCR noise from the source document in your answer — synthesize a clean, "
+        "readable response in your own words.\n\n"
+        "SAFETY RULE FOR MEDICAL/HEALTH DOCUMENTS: Never recommend contacting "
+        "specific named individuals (lab technicians, pathologists, report "
+        "signatories) as substitutes for consulting an actual treating doctor. "
+        "If asked for medical advice or next steps, clearly state you cannot "
+        "provide medical guidance and recommend consulting a qualified "
+        "healthcare professional — do not name lab staff as 'doctors to contact.'"
     )
 
     messages = [
@@ -216,10 +268,33 @@ def _generate_answer(question: str, chunks: list) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# STEP 8: MAIN QUESTION ANSWERING (with fallback escalation)
+# STEP 9: MAIN QUESTION ANSWERING (guardrails + fallback escalation)
 # ---------------------------------------------------------------------------
 
 def answer_question(question: str, document_id: int, db: Session) -> dict:
+    intent = classify_request_intent(question)
+    category = intent.get("category", "document_question")
+    logger.info(f"Request intent: {category}")
+
+    if category == "off_topic":
+        return {
+            "reply": "I can only answer questions about this document. Try asking something specific about its content!",
+            "sources": []
+        }
+
+    if category == "code_generation_request":
+        return {
+            "reply": "I can explain concepts from the document, but I don't generate new code that isn't in the document itself. Try asking me to explain the concept instead.",
+            "sources": []
+        }
+
+    if category == "raw_data_request":
+        return {
+            "reply": "I can summarize or answer specific questions about the document, but I can't dump raw internal data. What would you like to know?",
+            "sources": []
+        }
+
+    # category == "document_question" — proceed with normal RAG pipeline
     analysis = analyze_question(question)
     logger.info(f"Question analysis: {analysis}")
 
@@ -228,8 +303,7 @@ def answer_question(question: str, document_id: int, db: Session) -> dict:
 
     if analysis["is_broad"]:
         all_chunks = retrieve_all_chunks(document_id, db)
-        MAX_CHUNKS_FOR_BROAD = 60
-        merged_chunks = all_chunks[:MAX_CHUNKS_FOR_BROAD]
+        merged_chunks = all_chunks[:60]
     else:
         search_terms = analysis["search_terms"] or [question]
         for term in search_terms:
@@ -247,16 +321,11 @@ def answer_question(question: str, document_id: int, db: Session) -> dict:
 
     result = _generate_answer(question, merged_chunks)
 
-    # FALLBACK: if narrow retrieval failed to answer, escalate to the
-    # full document rather than giving up. Handles cases where a term
-    # appears throughout the doc and precise retrieval can't isolate
-    # the one sentence that actually answers the question.
     not_found_phrases = ["does not provide", "not found", "couldn't find", "no information", "not mentioned"]
     if not analysis["is_broad"] and any(phrase in result["reply"].lower() for phrase in not_found_phrases):
         logger.info("Narrow retrieval failed to answer — escalating to full document.")
         all_chunks = retrieve_all_chunks(document_id, db)
-        fallback_chunks = all_chunks[:60]
-        fallback_result = _generate_answer(question, fallback_chunks)
+        fallback_result = _generate_answer(question, all_chunks[:60])
         if not any(phrase in fallback_result["reply"].lower() for phrase in not_found_phrases):
             return fallback_result
 
